@@ -13,6 +13,7 @@ import ConflictBadge from '../components/common/ConflictBadge';
 import StatusChip from '../components/common/StatusChip';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
+import { usePlanAvailability } from '../hooks/usePlanAvailability';
 import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
@@ -32,20 +33,23 @@ export default function ExportPage() {
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
   const { conflictsOfNight, conflictIds } = useConflictCheck();
+  const availability = usePlanAvailability();
   const [notice, setNotice] = useState('');
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
   const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
+  const nightNotices = useMemo(() => (night ? availability.noticesOfNight(night.id) : []), [availability, night?.id]);
+  const nightMaintenanceOverlaps = useMemo(() => (night ? availability.overlapsOfNight(night.id) : []), [availability, night?.id]);
 
   const planText = useMemo(
-    () => buildNightPlanText({ night, sessions: nightSessions, targets, telescopes, instruments }),
-    [night, nightSessions, targets, telescopes, instruments],
+    () => buildNightPlanText({ night, sessions: nightSessions, targets, telescopes, instruments, notices: nightNotices, maintenanceOverlaps: nightMaintenanceOverlaps }),
+    [night, nightSessions, targets, telescopes, instruments, nightNotices, nightMaintenanceOverlaps],
   );
   const csv = useMemo(
-    () => buildPlanCsv({ night, sessions: nightSessions, targets, telescopes, instruments }),
-    [night, nightSessions, targets, telescopes, instruments],
+    () => buildPlanCsv({ night, sessions: nightSessions, targets, telescopes, instruments, notices: nightNotices, maintenanceOverlaps: nightMaintenanceOverlaps }),
+    [night, nightSessions, targets, telescopes, instruments, nightNotices, nightMaintenanceOverlaps],
   );
 
   const bars: TimelineBar[] = useMemo(
@@ -118,8 +122,39 @@ export default function ExportPage() {
       </Stack>
 
       <Box className="no-print" sx={{ mb: 3 }}>
-        <Timeline bars={bars} ticks={timelineTicks(120)} totalMinutes={NIGHT_TOTAL_MINUTES} conflictIds={ids} height={104} />
+        <Timeline bars={bars} ticks={timelineTicks(120)} totalMinutes={NIGHT_TOTAL_MINUTES} conflictIds={ids} height={104}>
+          {nightNotices.map((maintenance) => {
+            const start = Math.max(0, axisMinutes(maintenance.startTime));
+            const rawEnd = axisMinutes(maintenance.endTime);
+            const end = Math.min(NIGHT_TOTAL_MINUTES, rawEnd <= start ? rawEnd + 1440 : rawEnd);
+            return (
+              <Box
+                key={maintenance.id}
+                sx={{
+                  position: 'absolute',
+                  left: `${(start / NIGHT_TOTAL_MINUTES) * 100}%`,
+                  width: `${((end - start) / NIGHT_TOTAL_MINUTES) * 100}%`,
+                  top: 14,
+                  bottom: 0,
+                  border: '1px dashed',
+                  borderColor: 'warning.dark',
+                  bgcolor: 'warning.main',
+                  opacity: 0.22,
+                  pointerEvents: 'none',
+                }}
+                title={`维护 ${maintenance.noticeNo} ${maintenance.startTime}-${maintenance.endTime}`}
+              />
+            );
+          })}
+        </Timeline>
       </Box>
+
+      {nightMaintenanceOverlaps.length > 0 ? (
+        <Alert severity="warning" className="no-print" sx={{ mb: 2 }}>
+          维护交叠 {nightMaintenanceOverlaps.length} 处已原样写入导出：
+          {nightMaintenanceOverlaps.map((item) => ` ${item.noticeNo}×${item.sessionId}（${item.overlapMinutes}min）`).join('；')}
+        </Alert>
+      ) : null}
 
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '2fr 1fr' }, gap: 2 }}>
         <Paper variant="outlined" sx={{ p: 2 }}>
@@ -152,6 +187,30 @@ export default function ExportPage() {
             {nightSessions.length === 0 ? (
               <Typography variant="body2" color="text.secondary">
                 该观测夜暂无排程段
+              </Typography>
+            ) : null}
+          </Stack>
+          <Typography variant="subtitle2" sx={{ mt: 1.5, mb: 0.5 }}>
+            维护时段（{nightNotices.length} 段）
+          </Typography>
+          <Stack spacing={1}>
+            {nightNotices.map((maintenance) => {
+              const telescope = telescopes.find((item) => item.id === maintenance.telescopeId);
+              const maintainInstrument = instruments.find((item) => item.id === maintenance.instrumentId);
+              return (
+                <Stack key={maintenance.id} direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                  <Chip size="small" color="warning" variant="outlined" label={maintenance.noticeNo} />
+                  <Chip size="small" label={`${maintenance.startTime}-${maintenance.endTime}`} />
+                  <Typography variant="body2">
+                    {telescope?.code ?? maintenance.telescopeId} / {maintainInstrument ? maintainInstrument.model : '整机'}
+                  </Typography>
+                  <Chip size="small" variant="outlined" label={maintenance.status} />
+                </Stack>
+              );
+            })}
+            {nightNotices.length === 0 ? (
+              <Typography variant="body2" color="text.secondary">
+                无未取消维护预告，全部设备可用
               </Typography>
             ) : null}
           </Stack>

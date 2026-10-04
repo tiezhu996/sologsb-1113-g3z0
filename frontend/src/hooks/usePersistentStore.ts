@@ -1,12 +1,15 @@
 import Dexie, { type Table } from 'dexie';
 import { useEffect, useState } from 'react';
-import type { Instrument, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
+import type { Instrument, MaintenanceNotice, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
 
 /** IndexedDB 库名（浏览器本地存储，无后端） */
 export const DB_NAME = 'gbobsplan-db';
 
 /** 当前数据结构版本，写入每条记录并用于升级迁移判定 */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
+
+/** 维护预告回传检查点：最后一条已落库的回传编号，失败后从此处续投 */
+export const MAINTENANCE_CURSOR_KEY = 'maintenanceCursor';
 
 class ObsPlanDB extends Dexie {
   targets!: Table<ObsTarget, string>;
@@ -14,6 +17,7 @@ class ObsPlanDB extends Dexie {
   telescopes!: Table<Telescope, string>;
   instruments!: Table<Instrument, string>;
   nights!: Table<ObsNight, string>;
+  maintenanceNotices!: Table<MaintenanceNotice, string>;
   meta!: Table<{ key: string; value: string }, string>;
 
   constructor() {
@@ -47,20 +51,39 @@ class ObsPlanDB extends Dexie {
           .table('sessions')
           .toCollection()
           .modify((row: ObsSession) => {
-            if (row.schemaVersion !== SCHEMA_VERSION) {
-              row.schemaVersion = SCHEMA_VERSION;
+            if (row.schemaVersion !== 2) {
+              row.schemaVersion = 2;
             }
             if (!row.backupNightId && row.status === '因云取消' && backupNight) {
               row.backupNightId = backupNight.id;
             }
           });
       });
+
+    // v3：维护预告成为独立来源（maintenanceNotices），与排程段分两套来源对账。
+    // 已有数据没有任何维护记录 → 迁移为「可用」：不写预告，容量模型自然全部可用，仅登记迁移标记。
+    this.version(3)
+      .stores({
+        targets: 'id, name, catalog, type, priority, magnitude',
+        sessions: 'id, nightId, targetId, telescopeId, instrumentId, startTime, status, backupNightId',
+        telescopes: 'id, code, status',
+        instruments: 'id, model, telescopeCode, terminalType',
+        nights: 'id, date, siteName, primary, backup',
+        maintenanceNotices: 'id, noticeNo, nightId, telescopeId, instrumentId, status',
+        meta: 'key',
+      })
+      .upgrade(async (tx) => {
+        const count = await tx.table('maintenanceNotices').count();
+        if (count === 0) {
+          await tx.table('meta').put({ key: 'maintenanceMigrated', value: 'v3:available' });
+        }
+      });
   }
 }
 
 export const db = new ObsPlanDB();
 
-export type TableName = 'targets' | 'sessions' | 'telescopes' | 'instruments' | 'nights';
+export type TableName = 'targets' | 'sessions' | 'telescopes' | 'instruments' | 'nights' | 'maintenanceNotices';
 
 /** 写入单条记录（Dexie 读写封装，store 的增删改统一走这里） */
 export async function persistRow(table: TableName, row: unknown): Promise<void> {
@@ -75,6 +98,105 @@ export async function persistRows(table: TableName, rows: unknown[]): Promise<vo
 /** 删除记录 */
 export async function deleteRow(table: TableName, id: string): Promise<void> {
   await db.table(table).delete(id);
+}
+
+/* --------------------------- 维护预告回传（第二来源） --------------------------- */
+
+/** 设备组回传单条维护预告的载荷 */
+export interface MaintenanceIngestInput {
+  /** 设备组回传编号（重投时编号不变，作为幂等键） */
+  noticeNo: string;
+  nightId: string;
+  startTime: string;
+  endTime: string;
+  telescopeId: string;
+  /** 空串 = 望远镜整机停用 */
+  instrumentId?: string;
+  reason: string;
+  status?: MaintenanceNotice['status'];
+  receivedAt?: string;
+}
+
+export interface MaintenanceCursor {
+  /** 最后一条已确认落库的回传编号 */
+  noticeNo: string;
+  /** 确认时刻 ISO */
+  at: string;
+}
+
+/** 读取回传检查点（写入失败后从此处续投） */
+export async function getMaintenanceCursor(): Promise<MaintenanceCursor | null> {
+  const row = await db.meta.get(MAINTENANCE_CURSOR_KEY);
+  if (!row) return null;
+  try {
+    return JSON.parse(row.value) as MaintenanceCursor;
+  } catch {
+    return { noticeNo: row.value, at: '' };
+  }
+}
+
+/** 由回传编号生成稳定行 id：同编号重投永远命中同一行，不新增预告 */
+function maintenanceRowId(noticeNo: string): string {
+  return `mn-${noticeNo.trim().replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase()}`;
+}
+
+export interface IngestMaintenanceResult {
+  /** 实际新写入条数（重复编号重投计 0） */
+  inserted: number;
+  /** 本次（含重投跳过）处理过的回传编号，按输入顺序 */
+  processed: string[];
+  /** 落库后的预告记录 */
+  notices: MaintenanceNotice[];
+  /** 最后确认的检查点 */
+  cursor: MaintenanceCursor;
+}
+
+/**
+ * 接收设备组回传的维护预告。
+ * 幂等：以 noticeNo 为唯一键，重投不新增预告；
+ * 检查点：每条预告与其检查点在同一事务内原子推进，写入中途失败后重投整批，
+ * 已落库的编号自动跳过，从检查点之后继续。
+ */
+export async function ingestMaintenanceNotices(inputs: MaintenanceIngestInput[]): Promise<IngestMaintenanceResult> {
+  let inserted = 0;
+  const processed: string[] = [];
+  const notices: MaintenanceNotice[] = [];
+  let cursor: MaintenanceCursor = (await getMaintenanceCursor()) ?? { noticeNo: '', at: '' };
+
+  for (const input of inputs) {
+    const noticeNo = input.noticeNo;
+    const id = maintenanceRowId(noticeNo);
+    const receivedAt = input.receivedAt ?? new Date().toISOString();
+    // 每条 + meta 检查点原子提交：失败时该条与检查点都不会推进，可安全重投
+    const result = await db.transaction('rw', db.maintenanceNotices, db.meta, async () => {
+      const existing = await db.maintenanceNotices.get(id);
+      if (existing) {
+        return { row: existing, added: false };
+      }
+      const row: MaintenanceNotice = {
+        id,
+        noticeNo,
+        nightId: input.nightId,
+        startTime: input.startTime,
+        endTime: input.endTime,
+        telescopeId: input.telescopeId,
+        instrumentId: input.instrumentId?.trim() ?? '',
+        reason: input.reason.trim(),
+        status: input.status ?? '已预告',
+        receivedAt,
+        schemaVersion: SCHEMA_VERSION,
+      };
+      await db.maintenanceNotices.put(row);
+      await db.meta.put({ key: MAINTENANCE_CURSOR_KEY, value: JSON.stringify({ noticeNo, at: receivedAt }) });
+      return { row, added: true };
+    });
+    processed.push(noticeNo);
+    notices.push(result.row);
+    if (result.added) inserted += 1;
+    cursor = { noticeNo, at: receivedAt };
+  }
+
+  return { inserted, processed, notices, cursor };
 }
 
 /* ------------------------------- 示例数据 ------------------------------- */
@@ -134,18 +256,31 @@ const SEED_SESSIONS: ObsSession[] = [
   { id: 's-14', nightId: 'night-002', targetId: 'target-001', startTime: '02:10', endTime: '03:10', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
 ];
 
+/**
+ * 设备组回传的维护预告（独立第二来源）：
+ * mn-001 整机停用，与未取消的 s-03（20:40-22:10）、s-04（21:30-23:00）交叠；
+ * mn-002 整机停用，与已完成的 s-09 交叠（执行事实原样保留）；
+ * mn-003 已取消，不参与对账。
+ */
+const SEED_MAINTENANCE_NOTICES: MaintenanceNotice[] = [
+  { id: 'mn-001', noticeNo: 'MX-20251011-01', nightId: 'night-001', startTime: '21:00', endTime: '22:30', telescopeId: 'tel-002', instrumentId: '', reason: '赤道仪临时检修，设备组回传停用', status: '已预告', receivedAt: '2025-10-11T12:00:00.000Z', schemaVersion: SCHEMA_VERSION },
+  { id: 'mn-002', noticeNo: 'MX-20251012-01', nightId: 'night-002', startTime: '19:00', endTime: '20:00', telescopeId: 'tel-001', instrumentId: '', reason: '导星线缆更换', status: '已完成', receivedAt: '2025-10-12T11:20:00.000Z', schemaVersion: SCHEMA_VERSION },
+  { id: 'mn-003', noticeNo: 'MX-20251012-02', nightId: 'night-002', startTime: '03:00', endTime: '04:00', telescopeId: 'tel-002', instrumentId: '', reason: '检修提前结束，撤销停用', status: '已取消', receivedAt: '2025-10-12T15:00:00.000Z', schemaVersion: SCHEMA_VERSION },
+];
+
 /** 首次打开（表内无数据）时写入示例数据 */
 export async function seedIfEmpty(): Promise<void> {
   const flag = await db.meta.get('seeded');
   if (flag) return;
-  const [targetCount, sessionCount, telescopeCount, instrumentCount, nightCount] = await Promise.all([
+  const [targetCount, sessionCount, telescopeCount, instrumentCount, nightCount, maintenanceCount] = await Promise.all([
     db.targets.count(),
     db.sessions.count(),
     db.telescopes.count(),
     db.instruments.count(),
     db.nights.count(),
+    db.maintenanceNotices.count(),
   ]);
-  // Dexie 的 transaction 最多接受 5 张表 + 作用域，因此 meta 标记在事务外写入
+  // Dexie 的 transaction 最多接受 5 张表 + 作用域，因此维护预告与 meta 标记分开写入
   await db.transaction('rw', db.targets, db.sessions, db.telescopes, db.instruments, db.nights, async () => {
     if (targetCount === 0) await db.targets.bulkPut(SEED_TARGETS);
     if (nightCount === 0) await db.nights.bulkPut(SEED_NIGHTS);
@@ -153,22 +288,31 @@ export async function seedIfEmpty(): Promise<void> {
     if (instrumentCount === 0) await db.instruments.bulkPut(SEED_INSTRUMENTS);
     if (sessionCount === 0) await db.sessions.bulkPut(SEED_SESSIONS);
   });
+  if (maintenanceCount === 0) {
+    await db.maintenanceNotices.bulkPut(SEED_MAINTENANCE_NOTICES);
+    await db.meta.put({
+      key: MAINTENANCE_CURSOR_KEY,
+      value: JSON.stringify({ noticeNo: SEED_MAINTENANCE_NOTICES.filter((notice) => notice.status !== '已取消').slice(-1)[0]?.noticeNo ?? '', at: new Date(0).toISOString() }),
+    });
+  }
   await db.meta.put({ key: 'seeded', value: new Date().toISOString() });
 }
 
 /** 把 Dexie 数据同步到各 Zustand store（动态 import 规避模块循环依赖） */
 export async function hydrateAllStores(): Promise<void> {
-  const [{ useTargetStore }, { useSessionStore }, { useEquipmentStore }, { useNightStore }] = await Promise.all([
+  const [{ useTargetStore }, { useSessionStore }, { useEquipmentStore }, { useNightStore }, { useMaintenanceStore }] = await Promise.all([
     import('../stores/targetStore'),
     import('../stores/sessionStore'),
     import('../stores/equipmentStore'),
     import('../stores/nightStore'),
+    import('../stores/maintenanceStore'),
   ]);
   await Promise.all([
     useTargetStore.getState().hydrate(),
     useSessionStore.getState().hydrate(),
     useEquipmentStore.getState().hydrate(),
     useNightStore.getState().hydrate(),
+    useMaintenanceStore.getState().hydrate(),
   ]);
 }
 

@@ -15,6 +15,7 @@ import Snackbar from '@mui/material/Snackbar';
 import { Link as RouterLink, Outlet, useLocation } from 'react-router-dom';
 import { buildNightPlanText, downloadText } from './utils/export';
 import { usePersistentStore } from './hooks/usePersistentStore';
+import { usePlanAvailability } from './hooks/usePlanAvailability';
 import { useNightStore } from './stores/nightStore';
 import { useSessionStore } from './stores/sessionStore';
 import { useTargetStore } from './stores/targetStore';
@@ -40,6 +41,7 @@ export default function App() {
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
+  const availability = usePlanAvailability();
   const [toast, setToast] = useState(false);
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
@@ -51,6 +53,8 @@ export default function App() {
       targets,
       telescopes,
       instruments,
+      notices: night ? availability.noticesOfNight(night.id) : [],
+      maintenanceOverlaps: night ? availability.overlapsOfNight(night.id) : [],
     });
     downloadText(`观测清单-${night?.date ?? 'night'}.txt`, text);
     setToast(true);

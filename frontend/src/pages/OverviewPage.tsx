@@ -14,6 +14,7 @@ import StatusChip from '../components/common/StatusChip';
 import ConflictBadge from '../components/common/ConflictBadge';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
+import { usePlanAvailability } from '../hooks/usePlanAvailability';
 import { useNightStore } from '../stores/nightStore';
 import { useSessionStore } from '../stores/sessionStore';
 import { useTargetStore } from '../stores/targetStore';
@@ -32,11 +33,14 @@ export default function OverviewPage() {
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
   const { conflictIds, conflictsOfNight } = useConflictCheck();
+  const availability = usePlanAvailability();
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
   const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
+  const nightNotices = useMemo(() => (night ? availability.noticesOfNight(night.id) : []), [availability, night?.id]);
+  const nightMaintenanceOverlaps = useMemo(() => (night ? availability.overlapsOfNight(night.id) : []), [availability, night?.id]);
 
   /** 以夜间 22:00 作为高度角评估时刻 */
   const evaluateDate = useMemo(() => new Date(`${night?.date ?? '2025-10-11'}T22:00:00`), [night?.date]);
@@ -157,6 +161,16 @@ export default function OverviewPage() {
             </Typography>
           </CardContent>
         </Card>
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">
+              维护停用 / 交叠排程
+            </Typography>
+            <Typography variant="h5" color={nightMaintenanceOverlaps.length ? 'warning.main' : 'success.main'}>
+              {nightNotices.length} / {nightMaintenanceOverlaps.length}
+            </Typography>
+          </CardContent>
+        </Card>
       </Box>
 
       {conflicts.length > 0 ? (
@@ -165,6 +179,17 @@ export default function OverviewPage() {
           {conflicts.map((conflict) => (
             <div key={`${conflict.sessionId}-${conflict.otherId}`}>
               排程段 {conflict.sessionId} 与 {conflict.otherId} 在同一望远镜（{telescopeById(conflict.telescopeId)?.code ?? conflict.telescopeId}）上{conflict.overlapText}
+            </div>
+          ))}
+        </Alert>
+      ) : null}
+
+      {nightMaintenanceOverlaps.length > 0 ? (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          <AlertTitle>维护时段容量归零，与 {nightMaintenanceOverlaps.length} 段未取消排程重叠（两边时段、段号与交叠分钟均保留，执行事实未改动）</AlertTitle>
+          {nightMaintenanceOverlaps.map((item) => (
+            <div key={`${item.noticeId}-${item.sessionId}`}>
+              预告 {item.noticeNo}（{item.noticeRange}）× 排程段 {item.sessionId}（{item.sessionRange}）｜{telescopeById(item.telescopeId)?.code ?? item.telescopeId}｜交叠 {item.overlapMinutes} 分钟
             </div>
           ))}
         </Alert>
@@ -238,7 +263,33 @@ export default function OverviewPage() {
             </Typography>
           </Box>
         }
-      />
+      >
+        {/* 维护时段容量归零覆盖层（第二来源，与排程条同坐标） */}
+        {nightNotices.map((notice) => {
+          const start = Math.max(0, axisMinutes(notice.startTime));
+          const rawEnd = axisMinutes(notice.endTime);
+          const end = Math.min(NIGHT_TOTAL_MINUTES, rawEnd <= start ? rawEnd + 1440 : rawEnd);
+          const telescope = telescopeById(notice.telescopeId);
+          return (
+            <Box
+              key={notice.id}
+              sx={{
+                position: 'absolute',
+                left: `${(start / NIGHT_TOTAL_MINUTES) * 100}%`,
+                width: `${((end - start) / NIGHT_TOTAL_MINUTES) * 100}%`,
+                top: 14,
+                bottom: 0,
+                border: '1px dashed',
+                borderColor: 'warning.dark',
+                bgcolor: 'warning.main',
+                opacity: 0.22,
+                pointerEvents: 'none',
+              }}
+              title={`维护 ${notice.noticeNo} ${notice.startTime}-${notice.endTime} ${telescope?.code ?? ''} · ${notice.reason}`}
+            />
+          );
+        })}
+      </Timeline>
 
       <Box sx={{ mt: 2 }}>
         <Typography variant="subtitle1" sx={{ mb: 1 }}>
@@ -261,6 +312,13 @@ export default function OverviewPage() {
                       <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧 × ${target?.exposureSec ?? '-'}s`} />
                       <StatusChip status={session.status} />
                       {ids.has(session.id) ? <Chip size="small" color="error" label="时段冲突" /> : null}
+                      {availability.overlapsOfSession(session.id).length > 0 ? (
+                        <Chip
+                          size="small"
+                          color="warning"
+                          label={`维护交叠 ${availability.overlapsOfSession(session.id).reduce((sum, item) => sum + item.overlapMinutes, 0)} 分钟`}
+                        />
+                      ) : null}
                       {altitude?.below ? <Chip size="small" color="warning" label={`高度角 ${altitude.altitude}° 低于阈值 ${target?.minAltitude}°`} /> : <Chip size="small" color="success" variant="outlined" label={`高度角 ${altitude?.altitude ?? '-'}°`} />}
                       {session.rescheduleReason ? <Typography variant="caption" color="text.secondary">{session.rescheduleReason}</Typography> : null}
                     </Stack>

@@ -25,12 +25,13 @@ import ConflictBadge from '../components/common/ConflictBadge';
 import FieldRow from '../components/common/FieldRow';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
-import { useSessionStore } from '../stores/sessionStore';
+import { usePlanAvailability } from '../hooks/usePlanAvailability';
+import { useSessionStore, MaintenanceBlockedError } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
 import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
-import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
+import { axisMinutes, durationMinutes, formatMinutes, overlapMinutes } from '../utils/astro';
 
 interface SessionFormState {
   nightId: string;
@@ -58,6 +59,7 @@ export default function SessionsPage() {
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
   const { findConflicts, conflictIds } = useConflictCheck();
+  const availability = usePlanAvailability();
 
   /** 支持从设备分配视图一键跳转：?night=<夜ID>&highlight=<排程段ID> */
   const [searchParams] = useSearchParams();
@@ -117,6 +119,16 @@ export default function SessionsPage() {
     });
   }, [dialogOpen, findConflicts, form.nightId, form.telescopeId, form.startTime, form.endTime, editingId]);
 
+  /** 候选时段是否落入维护停用区间（容量归零，新排程将被拒绝） */
+  const liveMaintenance = useMemo(() => {
+    if (!dialogOpen || !form.nightId || !form.telescopeId) return [];
+    return availability.notices
+      .filter((notice) => notice.nightId === form.nightId && notice.telescopeId === form.telescopeId)
+      .filter((notice) => !notice.instrumentId || notice.instrumentId === form.instrumentId)
+      .map((notice) => ({ notice, minutes: overlapMinutes(notice.startTime, notice.endTime, form.startTime, form.endTime) }))
+      .filter((item) => item.minutes > 0);
+  }, [dialogOpen, availability.notices, form.nightId, form.telescopeId, form.instrumentId, form.startTime, form.endTime]);
+
   function openCreate() {
     setEditingId('');
     setError('');
@@ -171,14 +183,30 @@ export default function SessionsPage() {
       setError('该望远镜在所选时段已有排程，请调整时段或改期到备用观测夜');
       return;
     }
-    if (editingId) {
-      await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已更新排程段');
-    } else {
-      await addSession({ ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已新增排程段');
+    if (liveMaintenance.length > 0) {
+      setError(
+        `维护时段容量归零，拒绝新排程：${liveMaintenance
+          .map((item) => `预告 ${item.notice.noticeNo}（${item.notice.startTime}-${item.notice.endTime}）交叠 ${item.minutes} 分钟`)
+          .join('；')}`,
+      );
+      return;
     }
-    setDialogOpen(false);
+    try {
+      if (editingId) {
+        await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
+        setNotice('已更新排程段');
+      } else {
+        await addSession({ ...form, rescheduleReason: form.rescheduleReason });
+        setNotice('已新增排程段');
+      }
+      setDialogOpen(false);
+    } catch (reason) {
+      if (reason instanceof MaintenanceBlockedError) {
+        setError(reason.message);
+      } else {
+        setError((reason as Error).message || '排程写入失败');
+      }
+    }
   }
 
   async function submitReschedule() {
@@ -260,6 +288,7 @@ export default function SessionsPage() {
               <TableCell align="right">帧数</TableCell>
               <TableCell>状态</TableCell>
               <TableCell>冲突</TableCell>
+              <TableCell>维护停用</TableCell>
               <TableCell>改期原因</TableCell>
               <TableCell align="right">操作</TableCell>
             </TableRow>
@@ -309,6 +338,24 @@ export default function SessionsPage() {
                     <ConflictBadge conflicts={conflicts} compact />
                   </TableCell>
                   <TableCell>
+                    {availability.overlapsOfSession(session.id).length > 0 ? (
+                      <Stack spacing={0.5}>
+                        {availability.overlapsOfSession(session.id).map((item) => (
+                          <Chip
+                            key={item.noticeId}
+                            size="small"
+                            color="warning"
+                            label={`${item.noticeNo} · ${item.noticeRange} × 本段 ${item.sessionRange} · ${item.overlapMinutes}min`}
+                          />
+                        ))}
+                      </Stack>
+                    ) : (
+                      <Typography variant="caption" color="text.secondary">
+                        -
+                      </Typography>
+                    )}
+                  </TableCell>
+                  <TableCell>
                     {session.rescheduleReason ? (
                       <Typography variant="caption">{session.rescheduleReason}</Typography>
                     ) : (
@@ -353,6 +400,12 @@ export default function SessionsPage() {
               时段校验通过，该望远镜此时段空闲
             </Alert>
           )}
+          {liveMaintenance.length > 0 ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              维护时段容量归零，保存将被拒绝：
+              {liveMaintenance.map((item) => ` 预告 ${item.notice.noticeNo}（${item.notice.startTime}-${item.notice.endTime}，交叠 ${item.minutes} 分钟）`).join('；')}
+            </Alert>
+          ) : null}
           <FieldRow label="观测夜" required>
             <TextField select size="small" fullWidth value={form.nightId} onChange={(event) => setForm({ ...form, nightId: event.target.value })}>
               {nights.map((night) => (
