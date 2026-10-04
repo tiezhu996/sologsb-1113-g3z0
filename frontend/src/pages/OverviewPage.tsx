@@ -14,6 +14,7 @@ import StatusChip from '../components/common/StatusChip';
 import ConflictBadge from '../components/common/ConflictBadge';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
+import { useMaintenanceCheck } from '../hooks/useMaintenanceCheck';
 import { useNightStore } from '../stores/nightStore';
 import { useSessionStore } from '../stores/sessionStore';
 import { useTargetStore } from '../stores/targetStore';
@@ -32,11 +33,14 @@ export default function OverviewPage() {
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
   const { conflictIds, conflictsOfNight } = useConflictCheck();
+  const { noticesOfNight, overlapsOfNight } = useMaintenanceCheck();
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
   const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
+  const nightNotices = useMemo(() => noticesOfNight(night?.id ?? ''), [noticesOfNight, night?.id]);
+  const maintenanceOverlaps = useMemo(() => overlapsOfNight(night?.id ?? ''), [overlapsOfNight, night?.id]);
 
   /** 以夜间 22:00 作为高度角评估时刻 */
   const evaluateDate = useMemo(() => new Date(`${night?.date ?? '2025-10-11'}T22:00:00`), [night?.date]);
@@ -118,9 +122,10 @@ export default function OverviewPage() {
         <Chip label={`值班人 ${night.dutyOfficer}`} size="small" />
         <Chip label={`月相 ${night.moonPhasePct}%（${moonPhaseText(night.moonPhasePct)}）· 亮度折算 ${moonBrightnessFactor(night.moonPhasePct)}`} size="small" color="primary" variant="outlined" />
         <ConflictBadge conflicts={conflicts} />
+        <Chip label={`维护预告 ${nightNotices.length} 段`} size="small" color={nightNotices.length ? 'warning' : 'default'} variant="outlined" />
       </Stack>
 
-      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' }, gap: 2, mb: 2 }}>
+      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(5, 1fr)' }, gap: 2, mb: 2 }}>
         <Card variant="outlined">
           <CardContent>
             <Typography variant="caption" color="text.secondary">
@@ -150,6 +155,16 @@ export default function OverviewPage() {
         <Card variant="outlined">
           <CardContent>
             <Typography variant="caption" color="text.secondary">
+              维护交叠
+            </Typography>
+            <Typography variant="h5" color={maintenanceOverlaps.length ? 'error.main' : 'success.main'}>
+              {maintenanceOverlaps.length}
+            </Typography>
+          </CardContent>
+        </Card>
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">
               低于高度阈值（标灰）
             </Typography>
             <Typography variant="h5" color={dimmedTargets.length ? 'warning.main' : 'success.main'}>
@@ -165,6 +180,19 @@ export default function OverviewPage() {
           {conflicts.map((conflict) => (
             <div key={`${conflict.sessionId}-${conflict.otherId}`}>
               排程段 {conflict.sessionId} 与 {conflict.otherId} 在同一望远镜（{telescopeById(conflict.telescopeId)?.code ?? conflict.telescopeId}）上{conflict.overlapText}
+            </div>
+          ))}
+        </Alert>
+      ) : null}
+
+      {maintenanceOverlaps.length > 0 ? (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          <AlertTitle>维护预告与未取消排程段交叠 {maintenanceOverlaps.length} 处（容量已归零，执行事实原样保留）</AlertTitle>
+          {maintenanceOverlaps.map((overlap) => (
+            <div key={`${overlap.noticeId}-${overlap.sessionId}`}>
+              排程段 {overlap.sessionId}（{overlap.sessionStart}-{overlap.sessionEnd}）命中维护预告 {overlap.noticeStart}-{overlap.noticeEnd}（
+              {telescopeById(overlap.telescopeId)?.code ?? overlap.telescopeId} / {instrumentById(overlap.instrumentId)?.model ?? overlap.instrumentId}），交叠{' '}
+              {overlap.overlapMinutes} 分钟
             </div>
           ))}
         </Alert>

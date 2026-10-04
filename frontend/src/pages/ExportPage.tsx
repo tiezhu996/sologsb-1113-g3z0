@@ -13,6 +13,7 @@ import ConflictBadge from '../components/common/ConflictBadge';
 import StatusChip from '../components/common/StatusChip';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
+import { useMaintenanceCheck } from '../hooks/useMaintenanceCheck';
 import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
@@ -32,20 +33,23 @@ export default function ExportPage() {
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
   const { conflictsOfNight, conflictIds } = useConflictCheck();
+  const { noticesOfNight, overlapsOfNight } = useMaintenanceCheck();
   const [notice, setNotice] = useState('');
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
   const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === night?.id), [sessions, night?.id]);
   const conflicts = useMemo(() => conflictsOfNight(night?.id ?? ''), [conflictsOfNight, night?.id]);
   const ids = useMemo(() => conflictIds(night?.id), [conflictIds, night?.id]);
+  const nightNotices = useMemo(() => noticesOfNight(night?.id ?? ''), [noticesOfNight, night?.id]);
+  const maintenanceOverlaps = useMemo(() => overlapsOfNight(night?.id ?? ''), [overlapsOfNight, night?.id]);
 
   const planText = useMemo(
-    () => buildNightPlanText({ night, sessions: nightSessions, targets, telescopes, instruments }),
-    [night, nightSessions, targets, telescopes, instruments],
+    () => buildNightPlanText({ night, sessions: nightSessions, targets, telescopes, instruments, maintenances: nightNotices }),
+    [night, nightSessions, targets, telescopes, instruments, nightNotices],
   );
   const csv = useMemo(
-    () => buildPlanCsv({ night, sessions: nightSessions, targets, telescopes, instruments }),
-    [night, nightSessions, targets, telescopes, instruments],
+    () => buildPlanCsv({ night, sessions: nightSessions, targets, telescopes, instruments, maintenances: nightNotices }),
+    [night, nightSessions, targets, telescopes, instruments, nightNotices],
   );
 
   const bars: TimelineBar[] = useMemo(
@@ -93,6 +97,8 @@ export default function ExportPage() {
         <Chip size="small" label={`排程段 ${nightSessions.length}`} />
         <Chip size="small" label={`计划帧数合计 ${nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0)}`} />
         <ConflictBadge conflicts={conflicts} />
+        <Chip size="small" color={nightNotices.length ? 'warning' : 'default'} variant="outlined" label={`维护预告 ${nightNotices.length} 段`} />
+        <Chip size="small" color={maintenanceOverlaps.length ? 'error' : 'success'} variant="outlined" label={`维护交叠 ${maintenanceOverlaps.length} 处`} />
         <Button
           variant="contained"
           onClick={() => {

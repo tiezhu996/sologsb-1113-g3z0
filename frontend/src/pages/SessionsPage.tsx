@@ -19,12 +19,14 @@ import TableContainer from '@mui/material/TableContainer';
 import TableHead from '@mui/material/TableHead';
 import TableRow from '@mui/material/TableRow';
 import TextField from '@mui/material/TextField';
+import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import StatusChip from '../components/common/StatusChip';
 import ConflictBadge from '../components/common/ConflictBadge';
 import FieldRow from '../components/common/FieldRow';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
+import { useMaintenanceCheck } from '../hooks/useMaintenanceCheck';
 import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
@@ -58,6 +60,7 @@ export default function SessionsPage() {
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
   const { findConflicts, conflictIds } = useConflictCheck();
+  const { capacityOf, overlapsOfSession } = useMaintenanceCheck();
 
   /** 支持从设备分配视图一键跳转：?night=<夜ID>&highlight=<排程段ID> */
   const [searchParams] = useSearchParams();
@@ -117,6 +120,20 @@ export default function SessionsPage() {
     });
   }, [dialogOpen, findConflicts, form.nightId, form.telescopeId, form.startTime, form.endTime, editingId]);
 
+  /** 所选时段命中维护预告即容量归零（拒绝新排程） */
+  const capacityZero = useMemo(() => {
+    if (!dialogOpen || !form.nightId || !form.telescopeId || !form.instrumentId) return false;
+    return (
+      capacityOf({
+        nightId: form.nightId,
+        telescopeId: form.telescopeId,
+        instrumentId: form.instrumentId,
+        startTime: form.startTime,
+        endTime: form.endTime,
+      }) === 0
+    );
+  }, [dialogOpen, capacityOf, form.nightId, form.telescopeId, form.instrumentId, form.startTime, form.endTime]);
+
   function openCreate() {
     setEditingId('');
     setError('');
@@ -165,6 +182,10 @@ export default function SessionsPage() {
     }
     if (durationMinutes(form.startTime, form.endTime) <= 0) {
       setError('结束时刻必须晚于开始时刻');
+      return;
+    }
+    if (capacityZero) {
+      setError('所选时段命中维护预告，该望远镜与终端容量已归零，拒绝新排程，请调整时段或改期到备用观测夜');
       return;
     }
     if (liveConflicts.length > 0) {
@@ -273,6 +294,7 @@ export default function SessionsPage() {
                 endTime: session.endTime,
                 ignoreSessionId: session.id,
               });
+              const maintenanceHits = overlapsOfSession(session.id);
               return (
                 <TableRow
                   key={session.id}
@@ -307,6 +329,11 @@ export default function SessionsPage() {
                   </TableCell>
                   <TableCell>
                     <ConflictBadge conflicts={conflicts} compact />
+                    {maintenanceHits.length > 0 ? (
+                      <Tooltip title={maintenanceHits.map((hit) => hit.overlapText).join('；')}>
+                        <Chip size="small" color="warning" label={`维护交叠 ${maintenanceHits.length}`} sx={{ ml: 0.5 }} />
+                      </Tooltip>
+                    ) : null}
                   </TableCell>
                   <TableCell>
                     {session.rescheduleReason ? (
@@ -341,6 +368,11 @@ export default function SessionsPage() {
           {error ? (
             <Alert severity="error" sx={{ mb: 1.5 }}>
               {error}
+            </Alert>
+          ) : null}
+          {capacityZero ? (
+            <Alert severity="error" sx={{ mb: 1.5 }}>
+              所选时段命中维护预告，该望远镜与终端容量已归零，保存将被拒绝
             </Alert>
           ) : null}
           {liveConflicts.length > 0 ? (

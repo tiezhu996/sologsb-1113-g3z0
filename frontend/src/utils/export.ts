@@ -1,4 +1,5 @@
-import type { Instrument, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
+import type { Instrument, MaintenanceNotice, ObsNight, ObsSession, ObsTarget, Telescope } from '../types';
+import { buildMaintenanceOverlaps } from './maintenance';
 
 export interface PlanContext {
   night?: ObsNight;
@@ -6,6 +7,8 @@ export interface PlanContext {
   targets: ObsTarget[];
   telescopes: Telescope[];
   instruments: Instrument[];
+  /** 维护预告（与排程段分属两套来源，导出与总览、设备分配读同一结果） */
+  maintenances?: MaintenanceNotice[];
 }
 
 function pad(value: number, width = 2): string {
@@ -51,6 +54,31 @@ export function buildNightPlanText(context: PlanContext): string {
     return sum + (target ? (session.plannedFrames * target.exposureSec) / 60 : 0);
   }, 0);
   lines.push(`合计排程段 ${ordered.length} 段，计划帧数 ${totalFrames} 帧，预计曝光 ${totalExposure.toFixed(1)} 分钟`);
+  const maintenances = context.maintenances ?? [];
+  if (maintenances.length > 0) {
+    lines.push('-'.repeat(96));
+    lines.push('维护预告（容量归零时段，按望远镜与终端对账，该时段拒绝新排程）');
+    maintenances.forEach((notice, index) => {
+      const telescope = telescopes.find((item) => item.id === notice.telescopeId);
+      const instrument = instruments.find((item) => item.id === notice.instrumentId);
+      lines.push(
+        [
+          pad(index + 1),
+          `${notice.startTime}-${notice.endTime}`.padEnd(14, ' '),
+          (telescope?.code ?? '-').padEnd(8, ' '),
+          (instrument?.model ?? '-').padEnd(16, ' '),
+          `${notice.reason}（回传 ${notice.feedbackId}）`,
+        ].join(' '),
+      );
+    });
+    const overlaps = buildMaintenanceOverlaps(maintenances, sessions);
+    if (overlaps.length > 0) {
+      lines.push('维护 × 未取消排程段交叠（执行事实原样保留）');
+      overlaps.forEach((overlap) => {
+        lines.push(`预告 ${overlap.noticeStart}-${overlap.noticeEnd} × 排程段 ${overlap.sessionId}（${overlap.sessionStart}-${overlap.sessionEnd}）交叠 ${overlap.overlapMinutes} 分钟`);
+      });
+    }
+  }
   lines.push(`导出时间：${new Date().toLocaleString('zh-CN')}`);
   return lines.join('\n');
 }
@@ -58,7 +86,12 @@ export function buildNightPlanText(context: PlanContext): string {
 /** 生成 CSV */
 export function buildPlanCsv(context: PlanContext): string {
   const { sessions, targets, telescopes, instruments } = context;
-  const header = ['观测夜', '时段', '目标名', '星表编号', '类型', '视星等', '望远镜', '终端', '滤镜', '帧数', '单帧曝光(s)', '状态', '改期原因'];
+  const overlaps = buildMaintenanceOverlaps(context.maintenances ?? [], sessions);
+  const overlapMinutesBySession = new Map<string, number>();
+  overlaps.forEach((overlap) => {
+    overlapMinutesBySession.set(overlap.sessionId, (overlapMinutesBySession.get(overlap.sessionId) ?? 0) + overlap.overlapMinutes);
+  });
+  const header = ['观测夜', '时段', '目标名', '星表编号', '类型', '视星等', '望远镜', '终端', '滤镜', '帧数', '单帧曝光(s)', '状态', '改期原因', '维护交叠分钟'];
   const rows = [...sessions]
     .sort((a, b) => a.startTime.localeCompare(b.startTime))
     .map((session) => {
@@ -79,6 +112,7 @@ export function buildPlanCsv(context: PlanContext): string {
         target ? String(target.exposureSec) : '',
         session.status,
         session.rescheduleReason ?? '',
+        String(overlapMinutesBySession.get(session.id) ?? ''),
       ];
     });
   const csv = [header, ...rows]

@@ -19,6 +19,7 @@ import { useNightStore } from './stores/nightStore';
 import { useSessionStore } from './stores/sessionStore';
 import { useTargetStore } from './stores/targetStore';
 import { useEquipmentStore } from './stores/equipmentStore';
+import { useMaintenanceStore } from './stores/maintenanceStore';
 
 const DRAWER_WIDTH = 224;
 
@@ -40,6 +41,7 @@ export default function App() {
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
+  const maintenances = useMaintenanceStore((s) => s.notices);
   const [toast, setToast] = useState(false);
 
   const night = nights.find((item) => item.id === currentNightId) ?? nights[0];
@@ -51,6 +53,7 @@ export default function App() {
       targets,
       telescopes,
       instruments,
+      maintenances: maintenances.filter((notice) => notice.nightId === night?.id),
     });
     downloadText(`观测清单-${night?.date ?? 'night'}.txt`, text);
     setToast(true);
